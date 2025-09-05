@@ -1,3 +1,5 @@
+# ruff: noqa E402
+import os
 from typing import Optional, Union
 
 import torch
@@ -5,25 +7,52 @@ import torch.nn as nn
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import PatternPrettyPrinter, fwd_only, gen_pattern
 from torch.fx import GraphModule
+FLASHINFER_CACHE_DIR = "./flashinfer_cache"
+os.environ["CUDA_HOME"] = "/home/jeromeku/cuda-toolkit"
+os.environ["FLASHINFER_JIT_VERBOSE"] = "1"
+os.environ["FLASHINFER_WORKSPACE_BASE"] = FLASHINFER_CACHE_DIR
+os.makedirs(FLASHINFER_CACHE_DIR, exist_ok=True)
 
 # import tensorrt_llm
 # import tensorrt_llm._torch
 # import tensorrt_llm._torch.modules
 # import tensorrt_llm._torch.modules.rms_norm
+from flashinfer.norm import fused_add_rmsnorm, rmsnorm
 
-USE_FLASHINFER = False
+namespace = "custom"
+@torch.library.custom_op(f"{namespace}::flashinfer_rmsnorm", mutates_args=())
+def flashinfer_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    return rmsnorm(input, weight, eps, enable_pdl=False)
+
+
+@flashinfer_rmsnorm.register_fake
+def _(input: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    return torch.empty_like(input)
+
+
+@torch.library.custom_op(f"{namespace}::flashinfer_fused_add_rmsnorm", mutates_args=("input", "residual"))
+def flashinfer_fused_add_rmsnorm(
+    input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> None:
+    return fused_add_rmsnorm(input, residual, weight, eps, enable_pdl=False)
+
+
+@flashinfer_fused_add_rmsnorm.register_fake
+def _(
+    input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+    return torch.empty_like(input)
 
 
 class RMSNorm(nn.Module):
     def __init__(
         self,
-        *,
         hidden_size: int,
         eps: float,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
         has_weights: bool = True,
-        use_flashinfer: bool = False
+        use_flashinfer: bool = False,
     ):
         super().__init__()
         if has_weights:
@@ -41,14 +70,12 @@ class RMSNorm(nn.Module):
         residual: Optional[torch.Tensor] = ...,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         if self.use_flashinfer:
-            from flashinfer.norm import fused_add_rmsnorm, rmsnorm
-
             if isinstance(residual, torch.Tensor):
-                fused_add_rmsnorm(
+                flashinfer_fused_add_rmsnorm(
                     hidden_states, residual, self.weight, self.variance_epsilon
                 )
             else:
-                hidden_states = rmsnorm(
+                hidden_states = flashinfer_rmsnorm(
                     hidden_states, self.weight, self.variance_epsilon
                 )
         else:
@@ -80,7 +107,7 @@ class RMSNorm(nn.Module):
 
 def source_pattern(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float):
     at = auto_functionalized(
-        torch.ops.trtllm.flashinfer_fused_add_rmsnorm.default,
+        torch.ops.custom.flashinfer_fused_add_rmsnorm.default,
         input=x,
         residual=residual,
         weight=weight,
@@ -93,24 +120,33 @@ def source_pattern(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
 
 p = PatternPrettyPrinter()
 
-x = torch.empty((5, 3)).cuda().half()
+M, N = 4, 16
+x = torch.randn(M, N).cuda().half()
 res = x.clone()
-weight = torch.empty((3,)).cuda().half()
+weight = torch.ones((N,)).cuda().half()
 eps = 1e-5
 
-pattern = gen_pattern(source_pattern, [x, res, weight, eps], fwd_only)
+out = rmsnorm(x, weight=weight, eps=eps)
+ref_norm = RMSNorm(N, eps, dtype=x.dtype, device="cuda")
+ref = ref_norm(x)
+print((ref - out).abs().max().item())
+custom_out = torch.ops.custom.flashinfer_rmsnorm(x, weight, eps)
+print((ref - custom_out).abs().max().item())
 
+pattern = gen_pattern(source_pattern, [x, res, weight, eps], fwd_only)
+print(pattern)
 print(PatternPrettyPrinter.run(pattern))
 
 torch._dynamo.mark_dynamic(x, 0)
 
 def print_aten(gm: GraphModule, _):
     print("asdas", type(gm))
+    breakpoint()
     gm.graph.print_tabular()
     return gm
 
 
 func = torch.compile(source_pattern, backend=print_aten)
 
-# func = aot_function(source_pattern, fw_compiler=print_aten)
-# func(x, res, weight, eps)
+func = aot_function(source_pattern, fw_compiler=print_aten)
+func(x, res, weight, eps)

@@ -1,4 +1,4 @@
---extra-index-url https://download.pytorch.org/whl/cu128
+# --extra-index-url https://download.pytorch.org/whl/cu128
 -c constraints.txt
 accelerate>=1.7.0
 build
@@ -23,11 +23,11 @@ StrEnum
 sentencepiece>=0.1.99
 tensorrt~=10.11.0
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-06.html#rel-25-06 uses 2.8.0a0.
-torch>=2.7.1,<=2.8.0a0
-torchvision
-nvidia-modelopt[torch]~=0.33.0
-nvidia-nccl-cu12
-nvidia-cuda-nvrtc-cu12
+# torch>=2.7.1,<=2.8.0a0
+# torchvision
+# nvidia-modelopt[torch]~=0.33.0
+# nvidia-nccl-cu12
+# nvidia-cuda-nvrtc-cu12
 transformers==4.55.0
 prometheus_client
 prometheus_fastapi_instrumentator
@@ -36,7 +36,7 @@ pydantic-settings[yaml]
 omegaconf
 pillow==10.3.0
 wheel<=0.45.1
-optimum
+# optimum
 # evaluate needs datasets>=2.0.0 which triggers datasets>3.1.0 which is not stable: https://github.com/huggingface/datasets/issues/7467
 datasets==3.1.0
 evaluate
@@ -53,8 +53,8 @@ peft
 einops
 flashinfer-python==0.2.5
 opencv-python-headless
-xgrammar==0.1.21
-llguidance==0.7.29
+# xgrammar==0.1.21
+# llguidance==0.7.29
 jsonschema
 backoff
 nvtx
@@ -64,7 +64,7 @@ ninja
 etcd3
 blake3
 soundfile
-triton==3.3.1; platform_machine == "x86_64"
+# triton==3.3.1; platform_machine == "x86_64"
 tiktoken
 blobfile
 openai-harmony==0.0.4
