@@ -97,6 +97,292 @@ Putting it together — MoE runner end-to-end path with links:
   - GEMM2: [blockScaleMoe/runner.h (Gemm2::Runner)](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h) → same GEMM path
   - Finalize (unpermute + combine): [blockScaleMoe/DevKernel.cu](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/DevKernel.cu)
 
+Follow‑the‑code Checklist (MoE Runner)
+- Python entry:
+  - Op: [tensorrt_llm/_torch/custom_ops/trtllm_gen_custom_ops.py](../tensorrt_llm/_torch/custom_ops/trtllm_gen_custom_ops.py)
+    - Functions: `fp4_block_scale_moe_runner`, `fp8_block_scale_moe_runner`, `e4m3_mxe2m1_block_scale_moe_runner`, `fp8_fp4_block_scale_moe_runner`
+    - Heuristic: `calculate_tile_tokens_dim` and dynamic specs for autotuner
+  - Autotuner: [tensorrt_llm/_torch/autotuner.py](../tensorrt_llm/_torch/autotuner.py)
+    - `AutoTuner.choose_one`, `_profile_single_kernel`, `AutoTunerProfilingCache` (JSON persistence), `delay_kernel`
+- THOP C++ layer:
+  - Runners and bindings (Torch classes with `.def("run_moe", ...)`):
+    - FP8: [cpp/tensorrt_llm/thop/fp8BlockScaleMoe.cpp](../cpp/tensorrt_llm/thop/fp8BlockScaleMoe.cpp) → `FP8BlockScaleMoeRunner::run`
+    - FP4 / FP8+FP4: [cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp](../cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp) → `FP4BlockScaleMoeRunner::run`, `FP8FP4BlockScaleMoeRunner::run`
+    - Mixed MXE: [cpp/tensorrt_llm/thop/mxFp4BlockScaleMoe.cpp](../cpp/tensorrt_llm/thop/mxFp4BlockScaleMoe.cpp) → `MxE4m3MxE2m1BlockScaleMoeRunner::run`
+  - These construct `MoERunnerArgs`/workspace and call CUDA MoE runner
+- CUDA MoE orchestration:
+  - Orchestrator: [cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h), [runner.cu](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu)
+    - Entry: `tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner::run`
+    - Routing: `Routing::Runner::run` (DeepSeek/Llama4/Renormalize dispatch)
+      - Kernels: [RoutingDeepSeek.cu](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/RoutingDeepSeek.cu) `routingDeepSeek::routingMainKernel`, [RoutingLlama4.cu](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/RoutingLlama4.cu), [RoutingRenormalize.cu](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/RoutingRenormalize.cu)
+      - Types: [RoutingKernel.h](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/RoutingKernel.h)
+    - Permute+GEMM1: `PermuteGemm1::Runner::run` → batched GEMM
+    - Activation (DeepSeek FP8): `moe::dev::activation::run` in [DevKernel.cu](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/DevKernel.cu) (`activationKernel`, `activationDeepSeekKernel`)
+    - GEMM2: `Gemm2::Runner::run` → batched GEMM
+    - Finalize: `moe::dev::finalize::run` in [DevKernel.cu](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/DevKernel.cu) (`finalizeKernel`, `finalizeKernelVecLoad`, `finalizeDeepSeekKernel`)
+- Batched GEMM internals (both GEMM1 and GEMM2):
+  - Wrapper: [cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h](../cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h), [KernelRunner.cpp](../cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.cpp)
+    - Shape filtering: `getValidConfigIndices`, `getDefaultValidConfigIndex`
+    - Dispatch: `TrtllmGenBatchedGemmRunner::run`
+  - Final kernel launch path:
+    - [BatchedGemmInterface.h](../cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/BatchedGemmInterface.h): `BatchedGemmInterface::run`
+    - [KernelMetaInfo.h](../cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo.h): `config.mFunctionName`, CUBIN blobs
+    - [CudaKernelLauncher.h](../cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/CudaKernelLauncher.h): `launchKernel` → `cuLaunchKernelEx`
+
+Glossary: tactics, configs, and tiles
+- Tactic (`moeConfigIndex`): indexes a pair `(gemm1Config, gemm2Config)` in CUDA MoE runner’s `mPassingConfigs` (see [blockScaleMoe/runner.cu](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu)).
+- Config indices: produced by per‑GEMM `getValidConfigIndices` based on shapes and SM; resolved to a `config.mFunctionName` in [KernelMetaInfo.h](../cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo.h).
+- Token tiles: Python estimates CTA tile via `calculate_tile_tokens_dim` and CUDA computes runtime limits via `Routing::getMaxNumCtasInBatchDim`/`getMaxPermutedPaddedCount`.
+
+Autotuner Full Trace (Python ↔ Bindings ↔ CUDA)
+
+1) Python driver: choose_one
+
+```python
+def choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs) -> Tuple:
+    input_shapes = tuple(self._get_input_sizes(inputs))
+    if not self.is_tuning_mode:
+        is_cache_hit, best_runner_id, best_tactic, min_time = self.profiling_cache.search_cache(
+            custom_op, runners, input_shapes, tuning_config)
+        best_runner = runners[best_runner_id]
+        return (best_runner, best_tactic)
+    # ... generate profiles and profile runners ...
+```
+Source: [tensorrt_llm/_torch/autotuner.py:542](../tensorrt_llm/_torch/autotuner.py:542)
+
+2) Profiling loop: _profile_runners (tries tactics, records best)
+
+```python
+for runner_id, runner in enumerate(runners):
+    valid_tactics = runner.get_valid_tactics(input_tensors, profile, **kwargs)
+    if "do_preparation" in runner_arg_names and len(valid_tactics) > 0:
+        runner(input_tensors, tactic=-1, do_preparation=True, **kwargs)
+    for tac in valid_tactics:
+        try:
+            time_measured = self._profile_single_kernel(runner, input_tensors, tac, **kwargs)
+        except Exception as e:
+            # record failure, continue
+            time_measured = float('inf')
+            has_tuning_failure_occured = True
+        if time_measured < min_time:
+            min_time = time_measured
+            best_runner_id, best_tactic = runner_id, tac
+```
+Source: [tensorrt_llm/_torch/autotuner.py:677](../tensorrt_llm/_torch/autotuner.py:677)
+
+3) Insert best into cache (per profile)
+
+```python
+cache_key = self.profiling_cache.get_cache_key(custom_op, runners[best_runner_id], p.get_opt_shapes(), tuning_config)
+self.profiling_cache[cache_key] = (best_runner_id, best_tactic, min_time)
+```
+Source: [tensorrt_llm/_torch/autotuner.py:612](../tensorrt_llm/_torch/autotuner.py:612)
+
+4) Profiling a single tactic: warmup, delay kernel, CUDA events
+
+```python
+stream = torch.cuda.current_stream()
+for _ in range(self.warmup):
+    runner(inputs, tactic=tactic, **kwargs)
+stream.synchronize()
+
+delay_kernel(self.stream_delay_micro_secs, stream)
+start = torch.cuda.Event(enable_timing=True)
+end = torch.cuda.Event(enable_timing=True)
+start.record(stream=stream)
+for _ in range(self.repeat):
+    runner(inputs, tactic=tactic, **kwargs)
+end.record(stream=stream)
+stream.synchronize()
+avg_time = start.elapsed_time(end) / self.repeat
+```
+Source: [tensorrt_llm/_torch/autotuner.py:741](../tensorrt_llm/_torch/autotuner.py:741)
+
+5) Cache lookup and key generation
+
+```python
+def search_cache(self, custom_op, runners, input_shapes, tuning_config):
+    for r in runners:
+        if (cache_key := self.get_cache_key(custom_op, r, input_shapes, tuning_config)) in self.cache:
+            return True, *self.cache[cache_key]
+    return False, *self.fallback_entry()
+```
+Source: [tensorrt_llm/_torch/autotuner.py:333](../tensorrt_llm/_torch/autotuner.py:333)
+
+```python
+def get_cache_key(self, custom_op, runner, input_shapes, tuning_config) -> Tuple:
+    return (
+        custom_op,
+        runner.__class__.__name__,
+        hash(runner),
+        AutoTuner.get()._find_nearest_profile(
+            input_shapes, tuning_config.dynamic_tensor_specs, tuning_config.constraint_specs,
+            tuning_config.tune_max_num_tokens,
+        ),
+    )
+```
+Source: [tensorrt_llm/_torch/autotuner.py:358](../tensorrt_llm/_torch/autotuner.py:358)
+
+6) Delay kernel binding (Python ↔ C++)
+
+```cpp
+m.def(
+    "delay_kernel",
+    [](int64_t delay_micro_secs, py::object py_stream)
+    {
+        auto stream_ptr = py_stream.attr("cuda_stream").cast<int64_t>();
+        cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+        py::gil_scoped_release release;
+        tensorrt_llm::kernels::invokeDelayStreamKernel(delay_micro_secs, stream);
+    },
+    "Delay kernel launch on the default stream");
+```
+Source: [cpp/tensorrt_llm/pybind/runtime/bindings.cpp:416](../cpp/tensorrt_llm/pybind/runtime/bindings.cpp:416)
+
+7) Delay kernel (CUDA)
+
+```cpp
+__global__ void delayStreamKernel(long long delay_micro_secs)
+{
+    for (int i = 0; i < delay_micro_secs; ++i)
+    {
+        __nanosleep(1000);
+    }
+}
+
+void invokeDelayStreamKernel(long long delay_micro_secs, cudaStream_t stream)
+{
+    delayStreamKernel<<<1, 1, 0, stream>>>(delay_micro_secs);
+    check_cuda_error(cudaGetLastError());
+}
+```
+Source: [cpp/tensorrt_llm/kernels/delayStream.cu:23](../cpp/tensorrt_llm/kernels/delayStream.cu:23)
+
+Inline Trace With Snippets (Python → C++ → CUDA)
+
+1) Python: custom op + autotuner
+
+```python
+# trtllm_gen_custom_ops.py (FP8)
+@torch.library.custom_op("trtllm::fp8_block_scale_moe_runner", mutates_args=())
+def fp8_block_scale_moe_runner(...):
+    tuner = AutoTuner.get()
+    kernel_runner = FP8BlockScaleMoERunner(...)
+
+    _, best_tactic = tuner.choose_one(
+        "trtllm::fp8_block_scale_moe_runner",
+        [kernel_runner], kernel_runner.tuning_config, input_tensors_for_tuner,
+    )
+
+    input_tensors = input_tensors_for_tuner + [topk_weights, topk_ids]
+    input_tensors[0] = routing_logits
+    return kernel_runner(input_tensors, tactic=best_tactic)
+```
+Source: [tensorrt_llm/_torch/custom_ops/trtllm_gen_custom_ops.py:558](../tensorrt_llm/_torch/custom_ops/trtllm_gen_custom_ops.py:558)
+
+```python
+# Python Runner (FP8)
+class FP8BlockScaleMoERunner(TunableRunner):
+    def forward(self, inputs: List[torch.Tensor], tactic: int = -1) -> torch.Tensor:
+        args = FP8BlockScaleMoEInputs(*inputs)
+        kernel_runner = self.get_runner(args.hidden_states.shape[0])
+        return kernel_runner.run_moe(
+            args.routing_logits, args.routing_bias, args.hidden_states,
+            args.hidden_states_scale, args.gemm1_weights, args.gemm1_weights_scale,
+            args.gemm2_weights, args.gemm2_weights_scale,
+            self.num_experts, self.top_k, self.n_group, self.topk_group,
+            self.intermediate_size, self.local_expert_offset, self.local_num_experts,
+            self.routed_scaling_factor, self.routing_method_type, tactic,
+            args.topk_weights, args.topk_ids)
+```
+Source: [tensorrt_llm/_torch/custom_ops/trtllm_gen_custom_ops.py:744](../tensorrt_llm/_torch/custom_ops/trtllm_gen_custom_ops.py:744)
+
+2) C++ THOP: Torch class and registration
+
+```cpp
+// Register Torch custom classes and methods (FP8)
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.class_<torch_ext::FP8BlockScaleMoeRunner>("FP8BlockScaleMoERunner")
+        .def(torch::init<int64_t>())
+        .def("get_valid_configs", &torch_ext::FP8BlockScaleMoeRunner::getValidConfigs)
+        .def("run_moe", &torch_ext::FP8BlockScaleMoeRunner::run);
+}
+```
+Source: [cpp/tensorrt_llm/thop/fp8BlockScaleMoe.cpp:363](../cpp/tensorrt_llm/thop/fp8BlockScaleMoe.cpp:363)
+
+3) CUDA MoE orchestration (routing → GEMM1 → activation → GEMM2 → finalize)
+
+```cpp
+// MoE::Runner::run (orchestrates the whole MoE)
+// 1) GEMM1 (permute + grouped FC1)
+mPermuteGemm1.run(..., /*bmm1Workspace*/ workspace.bmm1_workspace, ..., config.gemm1Config);
+
+// 2) Optional activation (DeepSeek FP8)
+if (args.mDtypeElt == btg::Dtype::E4m3 && args.mUseDeepSeekFp8) {
+    moe::dev::activation::run(activationData, stream);
+    gemm2_input = workspace.activation_output;
+    gemm2_input_scale = workspace.activation_output_scale;
+}
+
+// 3) GEMM2 (FC2)
+mGemm2.run(gemm2_input, gemm2_input_scale, ..., workspace.bmm2_workspace, ..., config.gemm2Config);
+
+// 4) Finalize (unpermute + weighted combine + optional dequant)
+if (args.do_finalize) {
+    moe::dev::finalize::run(finalizeData, stream);
+}
+```
+Source: [cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu:520](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu:520)
+
+4) Routing kernels
+
+```cpp
+// Routing dispatch (DeepSeek V3)
+moe::dev::routing::routingDeepSeek::Data routingData;
+// ... fill routingData with logits/bias/shape/tiles ...
+moe::dev::routing::routingDeepSeek::run(routingData, stream);
+```
+Source: [cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu:67](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu:67)
+
+```cpp
+// Abridged DeepSeek routing kernel signature
+template <typename KernelParams>
+__global__ void routingMainKernel(KernelParams params) {
+    // sigmoid+bias, grouped top‑K selection, write topK ids/weights
+}
+```
+Source: [cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/RoutingDeepSeek.cu:27](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/RoutingDeepSeek.cu:27)
+
+5) GEMM kernel path and final launch
+
+```cpp
+// TrtllmGenBatchedGemmRunner::run → BatchedGemmInterface::run
+auto const& config = bmm.getBatchedGemmConfigs()[configIndex];
+// ... set up kernel params and grid ...
+// Load cubin from KernelMetaInfo.h and launch
+cuModuleLoadData(&cuModule, config.mData);
+cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
+auto result = trtllm::gen::launchKernel((void*) &kernelParams, cudaStream,
+    config.mSharedMemSize, cuFunction, block3, grid3, cluster3, /*enablesPdl*/ ...);
+```
+Source: [cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.cpp:322](../cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.cpp:322), [BatchedGemmInterface.h:747](../cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/BatchedGemmInterface.h:747), [CudaKernelLauncher.h:26](../cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/CudaKernelLauncher.h:26)
+
+6) Activation / Finalize CUDA kernels
+
+```cpp
+// Activation kernel (DeepSeek FP8 variant)
+__global__ void activationDeepSeekKernel(KernelParams params) {
+    // per‑block dequant, silu, write quantized output + scales
+}
+
+// Finalize kernels (vectorized / non‑vectorized, DeepSeek variant)
+__global__ void finalizeKernel(KernelParams params) { /* unpermute + reduce */ }
+__global__ void finalizeKernelVecLoad(KernelParams params) { /* 128‑bit loads */ }
+__global__ void finalizeDeepSeekKernel(KernelParams params) { /* fp8 route scales */ }
+```
+Source: [cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/DevKernel.cu:312](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/DevKernel.cu:312)
+
 How ops are registered with Torch:
 - Python level: `@torch.library.custom_op` creates an aten op name in the `trtllm` namespace and provides a Python implementation and a `.register_fake` for Dynamo/Inductor.
 - C++ level: `TORCH_LIBRARY_FRAGMENT(trtllm, m)` registers functions (`m.def(...)`) and custom classes (`m.class_<...>(...)`); device-specific impls are bound with `TORCH_LIBRARY_IMPL(trtllm, CUDA, m)` in other files.
