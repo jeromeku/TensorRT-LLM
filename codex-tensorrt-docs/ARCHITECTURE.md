@@ -81,12 +81,21 @@ C++ registration and kernel launch:
   - Invoke TRT-LLM Gen Runners (e.g., `tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner`) with current CUDA stream `at::cuda::getCurrentCUDAStream(...)`.
   - Return output tensors; tactic is the “config index” that selects a concrete kernel config.
 
-Putting it together — full dispatch path:
-- Python module calls `fp8_block_scale_moe_runner(...)`.
-- Python op constructs inputs for tuning (may synthesize logits for tuning only) and calls `AutoTuner.choose_one(...)` to pick tactic.
-- Python runner calls `torch.classes.trtllm.FP8BlockScaleMoERunner(tile_tokens_dim).run_moe(..., tactic)`.
-- C++ custom class marshals args/workspace and calls the underlying TRT-LLM Gen Runner.
-- CUDA kernels run; outputs flow back to Python.
+Putting it together — MoE runner end-to-end path with links:
+- Python calls op, e.g. [tensorrt_llm/_torch/custom_ops/trtllm_gen_custom_ops.py](../tensorrt_llm/_torch/custom_ops/trtllm_gen_custom_ops.py)
+  - Creates a Python `TunableRunner` and invokes [autotuner.py: AutoTuner.choose_one](../tensorrt_llm/_torch/autotuner.py) to pick tactic.
+  - Calls into C++ Torch class: `torch.classes.trtllm.FP8BlockScaleMoERunner(...).run_moe(...)`.
+- C++ THOP wrapper (Torch custom class):
+  - FP8: [cpp/tensorrt_llm/thop/fp8BlockScaleMoe.cpp](../cpp/tensorrt_llm/thop/fp8BlockScaleMoe.cpp) `.def("run_moe", ...)`
+  - FP4/Mixed: [cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp](../cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp), [cpp/tensorrt_llm/thop/mxFp4BlockScaleMoe.cpp](../cpp/tensorrt_llm/thop/mxFp4BlockScaleMoe.cpp)
+  - Forwards to CUDA MoE runner: `tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner::run(...)`.
+- CUDA MoE orchestration: [cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h), [runner.cu](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu)
+  - Routing: [RoutingDeepSeek.cu](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/RoutingDeepSeek.cu), [RoutingRenormalize.cu](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/RoutingRenormalize.cu), [RoutingLlama4.cu](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/RoutingLlama4.cu), types in [RoutingKernel.h](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/RoutingKernel.h)
+  - Permute + GEMM1: [blockScaleMoe/runner.h (PermuteGemm1::Runner)](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h) → [batchedGemm/KernelRunner.h](../cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h) / [KernelRunner.cpp](../cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.cpp)
+    - Final GEMM kernel launch via [BatchedGemmInterface.h](../cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/BatchedGemmInterface.h) and [KernelMetaInfo.h](../cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo.h) using [CudaKernelLauncher.h](../cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/CudaKernelLauncher.h)
+  - Activation (DeepSeek only): [blockScaleMoe/DevKernel.cu](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/DevKernel.cu)
+  - GEMM2: [blockScaleMoe/runner.h (Gemm2::Runner)](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h) → same GEMM path
+  - Finalize (unpermute + combine): [blockScaleMoe/DevKernel.cu](../cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/DevKernel.cu)
 
 How ops are registered with Torch:
 - Python level: `@torch.library.custom_op` creates an aten op name in the `trtllm` namespace and provides a Python implementation and a `.register_fake` for Dynamo/Inductor.
