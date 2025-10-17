@@ -4,7 +4,25 @@ This directory contains comprehensive documentation for the fused Mixture of Exp
 
 ## 📚 Documentation Files
 
-### 1. [Fused MoE Call Stack Trace](fused_moe_callstack_trace.md)
+### 1. [Complete Autotuning Trace](autotuning_detailed_trace.md) ⭐ NEW
+**Exhaustive line-by-line trace of the autotuning system**
+
+**Contents:**
+- Complete architecture with detailed diagrams
+- Initialization & setup phase
+- First invocation (tuning mode) - every function call documented
+- Subsequent invocations (inference mode) - cache lookup
+- Data structures with examples
+- Cache mechanism and serialization
+- Complete example walkthrough with real numbers
+
+**Best for:** Understanding how autotuning works from Python → C++ → CUDA, implementing custom tunable ops
+
+**See also:** [Autotuning Quick Start](README_AUTOTUNING.md)
+
+---
+
+### 2. [Fused MoE Call Stack Trace](fused_moe_callstack_trace.md)
 **Main architectural overview and high-level call flow**
 
 **Contents:**
@@ -19,7 +37,7 @@ This directory contains comprehensive documentation for the fused Mixture of Exp
 
 **Best for:** Understanding the overall system architecture and component interactions
 
-### 2. [Detailed Kernel Trace](detailed_kernel_trace.md)
+### 3. [Detailed Kernel Trace](detailed_kernel_trace.md)
 **Line-by-line kernel implementation details**
 
 **Contents:**
@@ -40,7 +58,7 @@ This directory contains comprehensive documentation for the fused Mixture of Exp
 
 **Best for:** Understanding exact kernel implementations and algorithms
 
-### 3. [Visual Guide & Quick Reference](visual_guide_and_reference.md)
+### 4. [Visual Guide & Quick Reference](visual_guide_and_reference.md)
 **Visual diagrams, tables, and practical guide**
 
 **Contents:**
@@ -71,15 +89,17 @@ This directory contains comprehensive documentation for the fused Mixture of Exp
 
 **I want to understand...**
 
+- **How autotuning works** → [Complete Autotuning Trace](autotuning_detailed_trace.md) ⭐
 - **How the overall pipeline works** → [Fused MoE Call Stack Trace](fused_moe_callstack_trace.md#architecture-overview)
 - **How tokens are permuted** → [Visual Guide](visual_guide_and_reference.md#token-permutation-example)
 - **How FP8 quantization works** → [Detailed Kernel Trace](detailed_kernel_trace.md#fp8-quantization-kernels)
 - **How group GEMM is implemented** → [Detailed Kernel Trace](detailed_kernel_trace.md#group-gemm-kernels)
-- **How autotuning works** → [Call Stack Trace](fused_moe_callstack_trace.md#component-4-autotuning-mechanisms)
 - **Performance characteristics** → [Visual Guide](visual_guide_and_reference.md#performance-characteristics)
 
 **I need to...**
 
+- **Implement a tunable op** → [Autotuning Quick Start](README_AUTOTUNING.md#implementing-a-tunable-op)
+- **Debug autotuning issues** → [Autotuning Trace - Debugging](autotuning_detailed_trace.md#cache-mechanism)
 - **Debug NaN/Inf issues** → [Visual Guide - Debugging](visual_guide_and_reference.md#3-naninf-in-output)
 - **Profile my MoE layer** → [Visual Guide - Profiling](visual_guide_and_reference.md#profiling--optimization)
 - **Use the Python API** → [Visual Guide - API Reference](visual_guide_and_reference.md#python-entry-points)
@@ -94,7 +114,7 @@ This directory contains comprehensive documentation for the fused Mixture of Exp
 | **FP8 Quantization** | [Architecture](fused_moe_callstack_trace.md#21-python-fp8-quantization) | [Kernels](detailed_kernel_trace.md#fp8-quantization-kernels) | [Layout](visual_guide_and_reference.md#fp8-block-scaling-layout) |
 | **Group GEMM** | [Architecture](fused_moe_callstack_trace.md#24-python-fc1-group-gemm-w3_w1) | [Kernels](detailed_kernel_trace.md#group-gemm-kernels) | [API](visual_guide_and_reference.md#python-entry-points) |
 | **Token Combine** | [Architecture](fused_moe_callstack_trace.md#component-3-token-combine-distribution-back) | [Kernels](detailed_kernel_trace.md#token-combine-kernels) | [Flow](visual_guide_and_reference.md#complete-pipeline-flow) |
-| **Autotuning** | [Architecture](fused_moe_callstack_trace.md#component-4-autotuning-mechanisms) | [Implementation](fused_moe_callstack_trace.md#42-cuteдsl-fp4-autotuning-example) | [Flow](visual_guide_and_reference.md#autotuning-flow) |
+| **Autotuning** | [Complete Trace](autotuning_detailed_trace.md) | [Examples](README_AUTOTUNING.md#usage-examples) | [Flow](visual_guide_and_reference.md#autotuning-flow) |
 
 ## 📂 File Structure Reference
 
