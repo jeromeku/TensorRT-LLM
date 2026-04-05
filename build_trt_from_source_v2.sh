@@ -1,5 +1,5 @@
 #!/bin/bash
-
+# https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel?version=1.3.0rc10
 set -euo pipefail
 
 TAG="1.3.0rc10"
